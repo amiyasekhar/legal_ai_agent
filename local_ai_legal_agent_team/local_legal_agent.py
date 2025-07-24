@@ -4,17 +4,8 @@ from agno.knowledge.pdf import PDFKnowledgeBase, PDFReader
 from agno.vectordb.qdrant import Qdrant
 from agno.models.ollama import Ollama
 from agno.embedder.ollama import OllamaEmbedder
-
-# For docx handling
-import docx2txt
-from langchain.text_splitter import CharacterTextSplitter
-
 import tempfile
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
-# If you have environment variables for anything, load them here.
 
 def init_session_state():
     if 'vector_db' not in st.session_state:
@@ -28,99 +19,41 @@ def init_qdrant():
     """Initialize local Qdrant vector database"""
     return Qdrant(
         collection="legal_knowledge",
-        url="http://localhost:6333",  # or your actual Qdrant URL
+        url="http://localhost:6333", 
         embedder=OllamaEmbedder(model="openhermes")
     )
 
-class DocxKnowledgeBase:
-    """
-    Minimal example knowledge base for DOC/DOCX files, similar to PDFKnowledgeBase.
-    Uses docx2txt + chunk splitting, then stores embeddings in Qdrant.
-    """
-    def __init__(self, vector_db, documents):
-        self.vector_db = vector_db
-        self.documents = documents  # store references if needed
-
-    def search(self, query: str, limit: int = 3):
-        """Use Qdrant vector search to find similar chunks."""
-        return self.vector_db.search(query=query, limit=limit)
-
 def process_document(uploaded_file, vector_db: Qdrant):
-    """
-    Process either a PDF or a Word file.
-    For PDFs: Use PDFKnowledgeBase (existing approach).
-    For DOC/DOCX: Use docx2txt + chunk splitting + store in Qdrant.
-    """
-    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-
+    """Process document using local resources"""
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_file_path = os.path.join(temp_dir, uploaded_file.name)
         with open(temp_file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        st.write("Processing document...")
-
-        if file_ext == ".pdf":
-            # --- PDF approach (existing) ---
+        try:
+            st.write("Processing document...")
+            # Create knowledge base with local embedder
             knowledge_base = PDFKnowledgeBase(
                 path=temp_dir,
                 vector_db=vector_db,
                 reader=PDFReader(chunk=True),
                 recreate_vector_db=True
             )
-            st.write("Loading PDF-based knowledge base...")
+            
+            st.write("Loading knowledge base...")
             knowledge_base.load()
-
-        elif file_ext in [".doc", ".docx"]:
-            # --- DOC/DOCX approach (LangChain) ---
-            st.write("Converting Word document to text...")
-            text = docx2txt.process(temp_file_path)
-
-            if not text.strip():
-                raise ValueError("No readable text found in the Word document.")
-
-            # Split text into chunks
-            text_splitter = CharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=100,
-                separator="\n"
-            )
-            chunks = text_splitter.split_text(text)
-            st.write(f"Created {len(chunks)} text chunks.")
-
-            # Use the same embedder from Qdrant
-            embedder = vector_db.embedder
-
-            # Clear existing docs if you want a fresh DB each time
-            vector_db.delete_all_documents()
-
-            documents = []
-            for i, chunk_text in enumerate(chunks):
-                doc_id = f"docx_chunk_{i}"
-                embedding = embedder.embed(chunk_text)
-                # Insert into Qdrant
-                vector_db.add_document(
-                    content=chunk_text,
-                    doc_id=doc_id,
-                    embedding=embedding,
-                    metadata={"source": uploaded_file.name, "chunk_index": i}
-                )
-                documents.append({"id": doc_id, "text": chunk_text})
-
-            # Create a minimal knowledge base for docx
-            knowledge_base = DocxKnowledgeBase(vector_db, documents)
-
-        else:
-            raise ValueError("Unsupported file format. Please upload PDF, DOC, or DOCX.")
-
-        # Quick verification
-        st.write("Verifying knowledge base with a test query ('test')...")
-        test_results = knowledge_base.search("test")
-        if not test_results:
-            raise Exception("Knowledge base verification failed (no search results).")
-
-        st.write("Knowledge base ready!")
-        return knowledge_base
+            
+            # Verify knowledge base
+            st.write("Verifying knowledge base...")
+            test_results = knowledge_base.search("test")
+            if not test_results:
+                raise Exception("Knowledge base verification failed")
+                
+            st.write("Knowledge base ready!")
+            return knowledge_base
+            
+        except Exception as e:
+            raise Exception(f"Error processing document: {str(e)}")
 
 def main():
     st.set_page_config(page_title="Local Legal Document Analyzer", layout="wide")
@@ -139,8 +72,7 @@ def main():
 
     # Document upload section
     st.header("📄 Document Upload")
-    # Now allow PDF, DOC, DOCX
-    uploaded_file = st.file_uploader("Upload Legal Document", type=['pdf','doc','docx'])
+    uploaded_file = st.file_uploader("Upload Legal Document", type=['pdf'])
     
     if uploaded_file:
         with st.spinner("Processing document..."):
@@ -148,11 +80,11 @@ def main():
                 knowledge_base = process_document(uploaded_file, st.session_state.vector_db)
                 st.session_state.knowledge_base = knowledge_base
                 
-                # Initialize agents with Llama model (or whichever model)
+                # Initialize agents with Llama model
                 legal_researcher = Agent(
                     name="Legal Researcher",
                     role="Legal research specialist",
-                    model=Ollama(id="llama3.1:8b"),
+                    model=Ollama(id="llama3.1:8b"),  
                     knowledge=st.session_state.knowledge_base,
                     search_knowledge=True,
                     instructions=[
@@ -230,7 +162,7 @@ def main():
     if not st.session_state.vector_db:
         st.info("👈 Waiting for Qdrant connection...")
     elif not uploaded_file:
-        st.info("👈 Please upload a legal PDF or Word document to begin analysis")
+        st.info("👈 Please upload a legal document to begin analysis")
     elif st.session_state.legal_team:
         st.header("Document Analysis")
   
@@ -271,9 +203,7 @@ def main():
         )
 
         if st.button("Analyze"):
-            if analysis_type == "Custom Query" and not user_query:
-                st.warning("Please enter a query")
-            else:
+            if user_query or analysis_type != "Custom Query":
                 with st.spinner("Analyzing document..."):
                     try:
                         # Combine predefined and user queries
@@ -301,7 +231,6 @@ def main():
                             if response.content:
                                 st.markdown(response.content)
                             else:
-                                # Fallback: show partial message content
                                 for message in response.messages:
                                     if message.role == 'assistant' and message.content:
                                         st.markdown(message.content)
@@ -340,8 +269,10 @@ def main():
 
                     except Exception as e:
                         st.error(f"Error during analysis: {str(e)}")
+            else:
+                st.warning("Please enter a query or select an analysis type")
     else:
-        st.info("Please upload a legal PDF or Word document to begin analysis")
+        st.info("Please upload a legal document to begin analysis")
 
 if __name__ == "__main__":
     main()

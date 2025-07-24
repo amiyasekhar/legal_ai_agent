@@ -1,358 +1,274 @@
 import streamlit as st
 from agno.agent import Agent
-# Removed the old PDFKnowledgeBase/PDFReader imports:
-# from agno.knowledge.pdf import PDFKnowledgeBase, PDFReader
+from agno.knowledge.pdf import PDFKnowledgeBase, PDFReader
 from agno.vectordb.qdrant import Qdrant
 from agno.tools.duckduckgo import DuckDuckGoTools
 from agno.models.openai import OpenAIChat
-
-# Use LangChain's PyPDFLoader for custom PDF ingestion
-from langchain.document_loaders import PyPDFLoader
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.text_splitter import CharacterTextSplitter
-
+from agno.embedder.openai import OpenAIEmbedder
 import tempfile
 import os
-from dotenv import load_dotenv
-import traceback  # For printing the full traceback
+from dotenv import load_dotenv  # ✅ ADD THIS
+from agno.document.chunking.document import DocumentChunking
 
-# For Word doc ingestion
-import docx2txt
-
+# ✅ Load .env values early
 load_dotenv()
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-QDRANT_API_KEY = os.environ.get('QDRANT_API_KEY')
-QDRANT_URL = os.environ.get('QDRANT_URL')
-
-# ------------------------------------------------------------------------------
-# QdrantDoc Class with all required attributes, including 'usage'
-# ------------------------------------------------------------------------------
-class QdrantDoc:
-    """
-    Qdrant expects each document to have:
-      - document.name       (string)
-      - document.content    (string)
-      - document.embedding  (list[float])
-      - document.meta_data  (dict)
-      - document.usage      (dict)
-      - document.embed()    (method)
-    """
-    def __init__(self, doc_id, embedding, payload, content: str):
-        self.id = doc_id
-        self.name = doc_id
-        self.embedding = embedding
-        self.meta_data = payload
-        self.content = content
-        self.usage = {}
-
-    def embed(self, embedder=None):
-        # We already have self.embedding, so no-op
-        pass
-
-# ------------------------------------------------------------------------------
-# Universal Embedder for PDF (string pages) & Word (string)
-# ------------------------------------------------------------------------------
-class UniversalEmbedder:
-    """
-    A universal wrapper around langchain.embeddings.OpenAIEmbeddings
-    that can embed strings from PDFs or DOCX.
-    """
-    def __init__(self, openai_api_key: str):
-        self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-    
-    def embed(self, text_data):
-        text = str(text_data)
-        return self.embeddings.embed_documents([text])[0]
-
-# ------------------------------------------------------------------------------
-# KnowledgeBase classes for PDF & DOCX
-# ------------------------------------------------------------------------------
-class CustomPDFKnowledgeBase:
-    """
-    Stores chunked PDF text in Qdrant, then can do .search(query).
-    """
-    def __init__(self, vector_db, documents):
-        self.vector_db = vector_db
-        self.documents = documents
-
-    def search(self, query: str, num_documents: int = 3, **kwargs):
-        # Force num_documents to be an int
-        if not isinstance(num_documents, int):
-            num_documents = 3
-        return self.vector_db.search(query=query, limit=num_documents)
-
-class DocxKnowledgeBase:
-    """
-    Minimal knowledge base for DOC/DOCX, storing doc chunks in Qdrant.
-    """
-    def __init__(self, vector_db, documents):
-        print("Qdrant object methods/attributes (DocxKnowledgeBase init):", dir(vector_db))
-        self.vector_db = vector_db
-        self.documents = documents
-
-    def search(self, query: str, num_documents: int = 3, **kwargs):
-        # Force num_documents to be an int
-        if not isinstance(num_documents, int):
-            num_documents = 3
-        return self.vector_db.search(query=query, limit=num_documents)
-
-# ------------------------------------------------------------------------------
-# PDF ingestion function
-# ------------------------------------------------------------------------------
-def ingest_pdf_document(pdf_path: str, vector_db: Qdrant, embedder: UniversalEmbedder):
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()  # list of Documents with .page_content as string
-
-    text_splitter = CharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100,
-        separator="\n"
-    )
-
-    documents = []
-    chunk_id = 0
-
-    for page in pages:
-        raw_text = page.page_content
-        chunks = text_splitter.split_text(raw_text)
-
-        for chunk_text in chunks:
-            doc_id = f"pdf_chunk_{chunk_id}"
-            embedding = embedder.embed(chunk_text)
-
-            doc_obj = QdrantDoc(
-                doc_id=doc_id,
-                embedding=embedding,
-                payload={
-                    "source": pdf_path,
-                    "chunk_index": chunk_id
-                },
-                content=chunk_text
-            )
-
-            vector_db.upsert([doc_obj])
-            documents.append({"id": doc_id, "text": chunk_text})
-            chunk_id += 1
-
-    return CustomPDFKnowledgeBase(vector_db, documents)
-
-# ------------------------------------------------------------------------------
-# Session & Qdrant initialization
-# ------------------------------------------------------------------------------
 def init_session_state():
+    """Initialize session state variables"""
     if 'openai_api_key' not in st.session_state:
-        st.session_state.openai_api_key = OPENAI_API_KEY
+        st.session_state.openai_api_key = os.getenv("OPENAI_API_KEY")  # ✅ auto-fill from .env
+
     if 'qdrant_api_key' not in st.session_state:
-        st.session_state.qdrant_api_key = QDRANT_API_KEY
+        st.session_state.qdrant_api_key = os.getenv("QDRANT_API_KEY")  # ✅ auto-fill from .env
+
     if 'qdrant_url' not in st.session_state:
-        st.session_state.qdrant_url = QDRANT_URL
+        st.session_state.qdrant_url = os.getenv("QDRANT_URL")  # ✅ auto-fill from .env
+
     if 'vector_db' not in st.session_state:
         st.session_state.vector_db = None
     if 'legal_team' not in st.session_state:
         st.session_state.legal_team = None
     if 'knowledge_base' not in st.session_state:
         st.session_state.knowledge_base = None
+    if 'processed_files' not in st.session_state:
+        st.session_state.processed_files = set()
+
+COLLECTION_NAME = "legal_documents"  # Define your collection name
 
 def init_qdrant():
-    if not st.session_state.qdrant_api_key:
-        raise ValueError("Qdrant API key not provided")
-    if not st.session_state.qdrant_url:
-        raise ValueError("Qdrant URL not provided")
-        
-    return Qdrant(
-        collection="legal_knowledge",
-        url=st.session_state.qdrant_url,
-        api_key=st.session_state.qdrant_api_key,
-        https=True,
-        timeout=None,
-        distance="cosine"
-    )
+    """Initialize Qdrant client with configured settings."""
+    if not all([st.session_state.qdrant_api_key, st.session_state.qdrant_url]):
+        return None
+    try:
+        # Create Agno's Qdrant instance which implements VectorDb
+        vector_db = Qdrant(
+            collection=COLLECTION_NAME,
+            url=st.session_state.qdrant_url,
+            api_key=st.session_state.qdrant_api_key,
+            embedder=OpenAIEmbedder(
+                id="text-embedding-3-small", 
+                api_key=st.session_state.openai_api_key
+            )
+        )
+        return vector_db
+    except Exception as e:
+        st.error(f"🔴 Qdrant connection failed: {str(e)}")
+        return None
 
-# ------------------------------------------------------------------------------
-# Document processing (PDF or DOCX)
-# ------------------------------------------------------------------------------
 def process_document(uploaded_file, vector_db: Qdrant):
+    """
+    Process document, create embeddings and store in Qdrant vector database
+    
+    Args:
+        uploaded_file: Streamlit uploaded file object
+        vector_db (Qdrant): Initialized Qdrant instance from Agno
+    
+    Returns:
+        PDFKnowledgeBase: Initialized knowledge base with processed documents
+    """
     if not st.session_state.openai_api_key:
         raise ValueError("OpenAI API key not provided")
         
     os.environ['OPENAI_API_KEY'] = st.session_state.openai_api_key
     
-    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
+    try:
+        # Save the uploaded file to a temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_file_path = temp_file.name
+        
+        st.info("Loading and processing document...")
+        
+        # Create a PDFKnowledgeBase with the vector_db
+        knowledge_base = PDFKnowledgeBase(
+            path=temp_file_path,  # Single string path, not a list
+            vector_db=vector_db,
+            reader=PDFReader(),
+            chunking_strategy=DocumentChunking(
+                chunk_size=1000,
+                overlap=200
+            )
+        )
+        
+        # Load the documents into the knowledge base
+        with st.spinner('📤 Loading documents into knowledge base...'):
+            try:
+                knowledge_base.load(recreate=True, upsert=True)
+                st.success("✅ Documents stored successfully!")
+            except Exception as e:
+                st.error(f"Error loading documents: {str(e)}")
+                raise
+        
+        # Clean up the temporary file
         try:
-            embedder = UniversalEmbedder(openai_api_key=st.session_state.openai_api_key)
+            os.unlink(temp_file_path)
+        except Exception:
+            pass
+            
+        return knowledge_base
+            
+    except Exception as e:
+        st.error(f"Document processing error: {str(e)}")
+        raise Exception(f"Error processing document: {str(e)}")
 
-            if file_ext == ".pdf":
-                knowledge_base = ingest_pdf_document(
-                    pdf_path=temp_file_path,
-                    vector_db=vector_db,
-                    embedder=embedder
-                )
-            elif file_ext in [".doc", ".docx"]:
-                raw_text = docx2txt.process(temp_file_path)
-                if not raw_text.strip():
-                    raise ValueError("No readable text found in the Word document.")
-
-                text_splitter = CharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=100,
-                    separator="\n"
-                )
-                chunks = text_splitter.split_text(raw_text)
-
-                documents = []
-                for i, chunk_text in enumerate(chunks):
-                    doc_id = f"docx_chunk_{i}"
-                    embedding = embedder.embed(chunk_text)
-                    
-                    doc_obj = QdrantDoc(
-                        doc_id=doc_id,
-                        embedding=embedding,
-                        payload={
-                            "source": uploaded_file.name,
-                            "chunk_index": i
-                        },
-                        content=chunk_text
-                    )
-                    vector_db.upsert([doc_obj])
-                    documents.append({"id": doc_id, "text": chunk_text})
-
-                knowledge_base = DocxKnowledgeBase(vector_db, documents)
-            else:
-                raise ValueError("Unsupported file type. Please upload PDF, DOC, or DOCX.")
-
-            # Quick test
-            test_results = knowledge_base.search("test")
-            if not test_results:
-                raise Exception("Knowledge base verification failed (no search results).")
-
-            return knowledge_base
-
-        except Exception as e:
-            traceback.print_exc()
-            raise Exception(f"Error processing document: {str(e)}")
-
-# ------------------------------------------------------------------------------
-# Main Streamlit App
-# ------------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Legal Document Analyzer", layout="wide")
     init_session_state()
 
     st.title("AI Legal Agent Team 👨‍⚖️")
 
-    try:
-        if not st.session_state.vector_db:
-            st.session_state.vector_db = init_qdrant()
-            st.success("Successfully connected to Qdrant!")
-    except Exception as e:
-        st.error(f"Failed to connect to Qdrant: {str(e)}")
-        return
+    with st.sidebar:
+        with st.expander("🔑 API Configuration"):
+            openai_key = st.text_input(
+                "OpenAI API Key",
+                type="password",
+                value=st.session_state.openai_api_key if st.session_state.openai_api_key else "",
+                help="Enter your OpenAI API key"
+            )
+            if openai_key:
+                st.session_state.openai_api_key = openai_key
 
-    st.header("📄 Document Upload")
-    uploaded_file = st.file_uploader("Upload Legal Document", type=['pdf','doc','docx'])
-    
-    if uploaded_file:
-        with st.spinner("Processing document..."):
-            try:
-                knowledge_base = process_document(uploaded_file, st.session_state.vector_db)
-                st.session_state.knowledge_base = knowledge_base
+            qdrant_key = st.text_input(
+                "Qdrant API Key",
+                type="password",
+                value=st.session_state.qdrant_api_key if st.session_state.qdrant_api_key else "",
+                help="Enter your Qdrant API key"
+            )
+            if qdrant_key:
+                st.session_state.qdrant_api_key = qdrant_key
 
-                # Agents initialization ...
-                legal_researcher = Agent(
-                    name="Legal Researcher",
-                    role="Legal research specialist",
-                    model=OpenAIChat(),
-                    tools=[DuckDuckGoTools()],
-                    knowledge=st.session_state.knowledge_base,
-                    search_knowledge=True,
-                    instructions=[
-                        "Find and cite relevant legal cases and precedents",
-                        "Provide detailed research summaries with sources",
-                        "Reference specific sections from the uploaded document",
-                        "Always search the knowledge base for relevant information"
-                    ],
-                    show_tool_calls=True,
-                    markdown=True
-                )
+            qdrant_url = st.text_input(
+                "Qdrant URL",
+                value=st.session_state.qdrant_url if st.session_state.qdrant_url else "",
+                help="Enter your Qdrant instance URL"
+            )
+            if qdrant_url:
+                st.session_state.qdrant_url = qdrant_url
 
-                contract_analyst = Agent(
-                    name="Contract Analyst",
-                    role="Contract analysis specialist",
-                    model=OpenAIChat(),
-                    knowledge=knowledge_base,
-                    search_knowledge=True,
-                    instructions=[
-                        "Review contracts thoroughly",
-                        "Identify key terms and potential issues",
-                        "Reference specific clauses from the document"
-                    ],
-                    markdown=True
-                )
-
-                legal_strategist = Agent(
-                    name="Legal Strategist", 
-                    role="Legal strategy specialist",
-                    model=OpenAIChat(),
-                    knowledge=knowledge_base,
-                    search_knowledge=True,
-                    instructions=[
-                        "Develop comprehensive legal strategies",
-                        "Provide actionable recommendations",
-                        "Consider both risks and opportunities"
-                    ],
-                    markdown=True
-                )
-
-                st.session_state.legal_team = Agent(
-                    name="Legal Team Lead",
-                    role="Legal team coordinator",
-                    model=OpenAIChat(),
-                    team=[legal_researcher, contract_analyst, legal_strategist],
-                    knowledge=st.session_state.knowledge_base,
-                    search_knowledge=True,
-                    instructions=[
-                        "Coordinate analysis between team members",
-                        "Provide comprehensive responses",
-                        "Ensure all recommendations are properly sourced",
-                        "Reference specific parts of the uploaded document",
-                        "Always search the knowledge base before delegating tasks"
-                    ],
-                    show_tool_calls=True,
-                    markdown=True
-                )
-                
-                st.success("✅ Document processed and team initialized!")
-                    
-            except Exception as e:
-                st.error(f"Error processing document: {str(e)}")
+            if all([st.session_state.qdrant_api_key, st.session_state.qdrant_url]):
+                try:
+                    if not st.session_state.vector_db:
+                        # Make sure we're initializing a QdrantClient here
+                        st.session_state.vector_db = init_qdrant()
+                        if st.session_state.vector_db:
+                            st.success("Successfully connected to Qdrant!")
+                except Exception as e:
+                    st.error(f"Failed to connect to Qdrant: {str(e)}")
 
         st.divider()
-        st.header("🔍 Analysis Options")
-        analysis_type = st.selectbox(
-            "Select Analysis Type",
-            [
-                "Contract Review",
-                "Legal Research",
-                "Risk Assessment",
-                "Compliance Check",
-                "Custom Query"
-            ]
-        )
-    else:
-        st.warning("Please upload a legal document (PDF, DOC, or DOCX) to begin analysis")
 
-    if not st.session_state.vector_db:
-        st.info("👈 Waiting for Qdrant connection...")
+        if all([st.session_state.openai_api_key, st.session_state.vector_db]):
+            st.header("📄 Document Upload")
+            uploaded_file = st.file_uploader("Upload Legal Document", type=['pdf'])
+            
+            if uploaded_file:
+                # Check if this file has already been processed
+                if uploaded_file.name not in st.session_state.processed_files:
+                    with st.spinner("Processing document..."):
+                        try:
+                            # Process the document and get the knowledge base
+                            knowledge_base = process_document(uploaded_file, st.session_state.vector_db)
+                            
+                            if knowledge_base:
+                                st.session_state.knowledge_base = knowledge_base
+                                # Add the file to processed files
+                                st.session_state.processed_files.add(uploaded_file.name)
+                                
+                                # Initialize agents
+                                legal_researcher = Agent(
+                                    name="Legal Researcher",
+                                    role="Legal research specialist",
+                                    model=OpenAIChat(id="gpt-4.1"),
+                                    tools=[DuckDuckGoTools()],
+                                    knowledge=st.session_state.knowledge_base,
+                                    search_knowledge=True,
+                                    instructions=[
+                                        "Find and cite relevant legal cases and precedents",
+                                        "Provide detailed research summaries with sources",
+                                        "Reference specific sections from the uploaded document",
+                                        "Always search the knowledge base for relevant information"
+                                    ],
+                                    show_tool_calls=True,
+                                    markdown=True
+                                )
+
+                                contract_analyst = Agent(
+                                    name="Contract Analyst",
+                                    role="Contract analysis specialist",
+                                    model=OpenAIChat(id="gpt-4.1"),
+                                    knowledge=st.session_state.knowledge_base,
+                                    search_knowledge=True,
+                                    instructions=[
+                                        "Review contracts thoroughly",
+                                        "Identify key terms and potential issues",
+                                        "Reference specific clauses from the document"
+                                    ],
+                                    markdown=True
+                                )
+
+                                legal_strategist = Agent(
+                                    name="Legal Strategist", 
+                                    role="Legal strategy specialist",
+                                    model=OpenAIChat(id="gpt-4.1"),
+                                    knowledge=st.session_state.knowledge_base,
+                                    search_knowledge=True,
+                                    instructions=[
+                                        "Develop comprehensive legal strategies",
+                                        "Provide actionable recommendations",
+                                        "Consider both risks and opportunities"
+                                    ],
+                                    markdown=True
+                                )
+
+                                # Legal Agent Team
+                                st.session_state.legal_team = Agent(
+                                    name="Legal Team Lead",
+                                    role="Legal team coordinator",
+                                    model=OpenAIChat(id="gpt-4.1"),
+                                    team=[legal_researcher, contract_analyst, legal_strategist],
+                                    knowledge=st.session_state.knowledge_base,
+                                    search_knowledge=True,
+                                    instructions=[
+                                        "Coordinate analysis between team members",
+                                        "Provide comprehensive responses",
+                                        "Ensure all recommendations are properly sourced",
+                                        "Reference specific parts of the uploaded document",
+                                        "Always search the knowledge base before delegating tasks"
+                                    ],
+                                    show_tool_calls=True,
+                                    markdown=True
+                                )
+                                
+                                st.success("✅ Document processed and team initialized!")
+                                
+                        except Exception as e:
+                            st.error(f"Error processing document: {str(e)}")
+                else:
+                    # File already processed, just show a message
+                    st.success("✅ Document already processed and team ready!")
+
+            st.divider()
+            st.header("🔍 Analysis Options")
+            analysis_type = st.selectbox(
+                "Select Analysis Type",
+                [
+                    "Contract Review",
+                    "Legal Research",
+                    "Risk Assessment",
+                    "Compliance Check",
+                    "Custom Query"
+                ]
+            )
+        else:
+            st.warning("Please configure all API credentials to proceed")
+
+    # Main content area
+    if not all([st.session_state.openai_api_key, st.session_state.vector_db]):
+        st.info("👈 Please configure your API credentials in the sidebar to begin")
     elif not uploaded_file:
-        st.info("👈 Please upload a PDF/DOC/DOCX to begin analysis")
+        st.info("👈 Please upload a legal document to begin analysis")
     elif st.session_state.legal_team:
+        # Create a dictionary for analysis type icons
         analysis_icons = {
             "Contract Review": "📑",
             "Legal Research": "🔍",
@@ -361,6 +277,7 @@ def main():
             "Custom Query": "💭"
         }
 
+        # Dynamic header with icon
         st.header(f"{analysis_icons[analysis_type]} {analysis_type} Analysis")
   
         analysis_configs = {
@@ -392,15 +309,17 @@ def main():
         }
 
         st.info(f"📋 {analysis_configs[analysis_type]['description']}")
-        st.write(f"🤖 Active Agents: {', '.join(analysis_configs[analysis_type]['agents'])}")
+        st.write(f"🤖 Active Legal AI Agents: {', '.join(analysis_configs[analysis_type]['agents'])}")  #dictionary!!
 
+        # Replace the existing user_query section with this:
         if analysis_type == "Custom Query":
             user_query = st.text_area(
                 "Enter your specific query:",
                 help="Add any specific questions or points you want to analyze"
             )
         else:
-            user_query = None
+            user_query = None  # Set to None for non-custom queries
+
 
         if st.button("Analyze"):
             if analysis_type == "Custom Query" and not user_query:
@@ -408,6 +327,10 @@ def main():
             else:
                 with st.spinner("Analyzing document..."):
                     try:
+                        # Ensure OpenAI API key is set
+                        os.environ['OPENAI_API_KEY'] = st.session_state.openai_api_key
+                        
+                        # Combine predefined and user queries
                         if analysis_type != "Custom Query":
                             combined_query = f"""
                             Using the uploaded document as reference:
@@ -429,6 +352,7 @@ def main():
 
                         response = st.session_state.legal_team.run(combined_query)
                         
+                        # Display results in tabs
                         tabs = st.tabs(["Analysis", "Key Points", "Recommendations"])
                         
                         with tabs[0]:
@@ -475,7 +399,7 @@ def main():
                     except Exception as e:
                         st.error(f"Error during analysis: {str(e)}")
     else:
-        st.info("Please upload a PDF/DOC/DOCX to begin analysis")
+        st.info("Please upload a legal document to begin analysis")
 
 if __name__ == "__main__":
     main()
